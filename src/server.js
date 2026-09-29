@@ -14,15 +14,76 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
-    let data = '';
-    req.on('data', (chunk) => (data += chunk));
-    req.on('end', () => resolve(data));
+function humanSize(bytes) {
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}
+
+/* Lee el body con tope duro: una subida de 600 MB (el sample que genera el
+   README) ya no se carga entera en memoria. Concatenar strings (data += chunk)
+   era O(n^2) en copias; acumular Buffers es O(n). */
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      req.resume();
+      const err = new Error(`request too large: limit is ${humanSize(maxBytes)}`);
+      err.statusCode = 413;
+      return reject(err);
+    }
+
+    const chunks = [];
+    let size = 0;
+    let over = false;
+
+    req.on('data', (chunk) => {
+      if (over) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        over = true;
+        chunks.length = 0;
+        const err = new Error(`request too large: limit is ${humanSize(maxBytes)}`);
+        err.statusCode = 413;
+        return reject(err);
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!over) resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', reject);
   });
 }
 
+/* El nombre que envia el cliente es SOLO una etiqueta de la UI: nunca se usa
+   como ruta en disco. Cada escaneo se guarda con un uuid que generamos,
+   asi que nada de lo que envie el cliente puede sacar la escritura fuera de
+   data/uploads/. Antes, filename=../../evil.txt escribia en la raiz del repo. */
+function displayName(raw) {
+  const cleaned = String(raw || '')
+    .split(/[\\/]/).pop()              /* quita cualquier ruta */
+    .replace(/[\x00-\x1f\x7f]/g, '')   /* quita caracteres de control */
+    .trim()
+    .slice(0, 200);
+  return cleaned || 'untitled.txt';
+}
+
+/* El manejador es async: sin este try/catch, un throw en cualquier ruta se
+   convierte en una promesa rechazada sin consumidor y tumba el proceso. */
 const server = http.createServer(async (req, res) => {
+  try {
+    await handle(req, res);
+  } catch (err) {
+    console.error('unhandled error in', req.method, req.url, err);
+    if (res.headersSent) return res.end();
+    /* El detalle del error va al log del servidor, no al cliente: un stack
+       trace o una ruta de fichero no le dicen nada util a un empleado. */
+    return send(res, 500, { error: 'internal server error' });
+  }
+});
+
+async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const parts = url.pathname.split('/').filter(Boolean);
   console.log(req.method, url.pathname);
@@ -44,24 +105,33 @@ const server = http.createServer(async (req, res) => {
 
   // POST /documents?filename=foo.txt   (raw body = document text, pages separated by \f)
   if (req.method === 'POST' && url.pathname === '/documents') {
-    const body = await readBody(req);
-    const id = crypto.randomUUID();
-    const filename = url.searchParams.get('filename') || 'untitled.txt';
-    const filePath = path.join(config.uploadDir, filename);
-    fs.writeFileSync(filePath, body);
+    const filename = displayName(url.searchParams.get('filename'));
 
-    const data = db.load();
-    data.documents[id] = {
-      id,
-      filename,
-      filePath,
-      status: 'pending',
-      pages: [],
-      createdAt: new Date().toISOString(),
-    };
-    db.save(data);
+    let body;
+    try {
+      body = await readBody(req, config.maxUploadBytes);
+    } catch (err) {
+      return send(res, err.statusCode || 400, { error: err.message });
+    }
+    if (!body.length) return send(res, 400, { error: 'empty document' });
+
+    const id = crypto.randomUUID();
+    const filePath = path.join(config.uploadDir, `${id}.txt`);
+    await fs.promises.writeFile(filePath, body);
+
+    const created = await db.update((data) => {
+      data.documents[id] = {
+        id,
+        filename,
+        filePath,
+        status: 'pending',
+        pages: [],
+        createdAt: new Date().toISOString(),
+      };
+      return data.documents[id];
+    });
     enqueue(id);
-    return send(res, 201, data.documents[id]);
+    return send(res, 201, created);
   }
 
   // GET /documents
@@ -89,12 +159,16 @@ const server = http.createServer(async (req, res) => {
 
   // POST /documents/:id/retry
   if (req.method === 'POST' && parts[0] === 'documents' && parts[2] === 'retry') {
-    const data = db.load();
-    const doc = data.documents[parts[1]];
-    doc.status = 'pending';
-    db.save(data);
-    enqueue(doc.id);
-    return send(res, 202, { id: doc.id, status: doc.status });
+    // Antes: doc en undefined -> TypeError sin capturar -> el proceso entero moria.
+    const retried = await db.update((data) => {
+      const doc = data.documents[parts[1]];
+      if (!doc) return false;
+      doc.status = 'pending';
+      return true;
+    });
+    if (!retried) return send(res, 404, { error: 'not found' });
+    enqueue(parts[1]);
+    return send(res, 202, { id: parts[1], status: 'pending' });
   }
 
   // GET /search?q=lumen&category=meals
@@ -130,15 +204,28 @@ const server = http.createServer(async (req, res) => {
 
   // POST /ask   {"question": "..."}
   if (req.method === 'POST' && url.pathname === '/ask') {
-    const { question } = JSON.parse(await readBody(req));
+    let question;
+    try {
+      ({ question } = JSON.parse(await readBody(req, config.maxAskBytes)));
+    } catch (err) {
+      // Antes: JSON.parse a pelo -> SyntaxError -> el proceso moria.
+      return send(res, err.statusCode || 400, { error: 'could not read the request body as JSON' });
+    }
+    if (typeof question !== 'string' || !question.trim()) {
+      return send(res, 400, { error: 'the request must include a non-empty "question" string' });
+    }
+
     const result = await ask(question);
     return send(res, 200, result);
   }
 
   send(res, 404, { error: 'not found' });
-});
+}
 
 startWorker();
 server.listen(config.port, () => {
   console.log(`receiptbox listening on http://localhost:${config.port}`);
 });
+
+/* Exportamos el servidor para que los tests de integracion puedan cerrarlo. */
+export { server };
